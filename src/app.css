@@ -1,0 +1,41 @@
+:root {
+  --bg: #0f1117;
+  --surface: #171a23;
+  --surface-hover: #1e222e;
+  --border: #272c3a;
+  --text: #e6e9f2;
+  --muted: #8b93a7;
+  --accent: #38bdf8;
+  --accent-strong: #0ea5e9;
+  --success: #34d399;
+  --warning: #fbbf24;
+  --danger: #f87171;
+  font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Inter, sans-serif;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+input {
+  font-family: inherit;
+}
+
+.mono {
+  font-family: "Cascadia Code", Consolas, monospace;
+}
