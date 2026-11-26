@@ -16,6 +16,7 @@
         return "ok";
       case "merge":
       case "auto-map":
+      case "dedupe":
         return "info";
       case "conflict":
       case "delete":

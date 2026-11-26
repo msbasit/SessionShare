@@ -266,11 +266,37 @@ pub struct DesktopSessionFile {
     pub filename: String,
     pub path: PathBuf,
     pub cwd: Option<String>,
+    /// Claude Code transcript this sidebar entry points to (the conversation's real identity).
+    pub cli_session_id: Option<String>,
+    /// `createdAt` (ms); stable across edits, so every PC picks the same entry among duplicates.
+    pub created_at: Option<i64>,
 }
 
 /// Extracts the normalized working directory (`cwd`) from a Claude Desktop `local_*.json` string.
 pub fn extract_desktop_session_cwd(raw: &str) -> Option<String> {
     let val: Value = serde_json::from_str(raw).ok()?;
+    desktop_session_cwd(&val)
+}
+
+/// Extracts `(cliSessionId, createdAt)` from a Claude Desktop `local_*.json` string.
+pub fn desktop_session_identity(raw: &str) -> (Option<String>, Option<i64>) {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(val) => desktop_identity_of(&val),
+        Err(_) => (None, None),
+    }
+}
+
+fn desktop_identity_of(val: &Value) -> (Option<String>, Option<i64>) {
+    let cli = val
+        .get("cliSessionId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    (cli, val.get("createdAt").and_then(|v| v.as_i64()))
+}
+
+fn desktop_session_cwd(val: &Value) -> Option<String> {
     let cwd = val
         .get("cwd")
         .and_then(|v| v.as_str())
@@ -319,15 +345,22 @@ pub fn scan_desktop_sessions(sessions_root: &Path) -> Vec<DesktopSessionFile> {
                     continue;
                 }
                 let path = file_entry.path();
-                let cwd = fs::read_to_string(&path)
+                let parsed = fs::read_to_string(&path)
                     .ok()
-                    .and_then(|raw| extract_desktop_session_cwd(&raw));
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+                let cwd = parsed.as_ref().and_then(desktop_session_cwd);
+                let (cli_session_id, created_at) = parsed
+                    .as_ref()
+                    .map(desktop_identity_of)
+                    .unwrap_or((None, None));
                 out.push(DesktopSessionFile {
                     account_id: account_id.clone(),
                     org_id: org_id.clone(),
                     filename,
                     path,
                     cwd,
+                    cli_session_id,
+                    created_at,
                 });
             }
         }

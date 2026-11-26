@@ -1,7 +1,8 @@
 use crate::claude_fs::{
     auto_resolve_unmapped_project, canonical_id_from_git, canonical_id_from_name,
     compute_home_relative_hint, default_desktop_account_org, default_home_dir,
-    display_name_from_path, encode_project_path, inspect_session_file, normalize_windows_path,
+    desktop_session_identity, display_name_from_path, encode_project_path, inspect_session_file,
+    normalize_windows_path,
     resolve_claude_desktop_sessions_dir, resolve_encoded_project_dir, scan_desktop_sessions,
     scan_local_projects, DesktopSessionFile, SessionFileMeta,
 };
@@ -56,6 +57,15 @@ struct GenericConflict<'a> {
     gated: bool,
 }
 
+/// A Claude Desktop record found on the synced drive.
+struct RemoteDesktopRecord {
+    key: String,
+    account_id: String,
+    org_id: String,
+    filename: String,
+    content: String,
+}
+
 /// Both versions of a held conflict in the form shown to the user.
 struct ConflictSides {
     kind: &'static str,
@@ -82,6 +92,9 @@ pub struct SyncEngine {
     batch: String,
 }
 
+/// Projects, number auto-mapped, and `(removed_id, kept_id)` duplicate mappings that were healed.
+type Discovery = (Vec<ProjectView>, usize, Vec<(String, String)>);
+
 /// Result of reconciling local Claude projects with the shared registry (not yet persisted).
 struct Reconciled {
     registry: Registry,
@@ -90,6 +103,8 @@ struct Reconciled {
     config_dirty: bool,
     auto_mapped: usize,
     local_counts: BTreeMap<String, usize>,
+    /// `(removed_id, kept_id)`: projects unmapped because another project already uses their folder.
+    unmapped_duplicates: Vec<(String, String)>,
 }
 
 fn roots_identity(cfg: &AppConfig) -> String {
@@ -196,6 +211,84 @@ fn tracked_hash<'a>(state: &'a Option<FileState>, local_path: &str) -> Option<&'
         .as_ref()
         .filter(|s| s.local_path.as_deref() == Some(local_path))
         .map(|s| s.hash.as_str())
+}
+
+/// Ordering used whenever two canonical projects compete for the same content: Git-identified
+/// projects first, then the oldest registry entry, then the ID. Depends only on shared registry
+/// data, so every PC makes the same choice.
+fn project_rank(registry: &Registry, cid: &str) -> (bool, chrono::DateTime<Utc>, String) {
+    let created = registry
+        .projects
+        .get(cid)
+        .map(|p| p.created_at)
+        .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
+    (!cid.starts_with("git-"), created, cid.to_string())
+}
+
+/// Ensures no two canonical projects are mapped to the same local folder on this PC (which would
+/// upload every transcript of that folder once per project). Keeps the best-ranked project.
+/// Returns `(removed_id, kept_id)` pairs.
+fn dedupe_project_mappings(config: &mut AppConfig, registry: &Registry) -> Vec<(String, String)> {
+    let mut by_path: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (cid, path) in &config.local_project_paths {
+        by_path
+            .entry(normalize_windows_path(path).to_ascii_lowercase())
+            .or_default()
+            .push(cid.clone());
+    }
+    let mut removed = Vec::new();
+    for (_, mut ids) in by_path {
+        if ids.len() < 2 {
+            continue;
+        }
+        ids.sort_by_key(|cid| project_rank(registry, cid));
+        let keep = ids[0].clone();
+        for loser in &ids[1..] {
+            config.local_project_paths.remove(loser);
+            config.mapping_sources.remove(loser);
+            removed.push((loser.clone(), keep.clone()));
+        }
+    }
+    removed
+}
+
+/// Uploads a grown `.jsonl` by appending only the new tail when the stored copy is a prefix of
+/// it; otherwise rewrites the file.
+fn push_jsonl(provider: &dyn StorageProvider, key: &str, stored: &str, updated: &str) -> Result<()> {
+    if !stored.is_empty() && stored.ends_with('\n') {
+        if let Some(tail) = updated.strip_prefix(stored) {
+            if tail.is_empty() {
+                return Ok(());
+            }
+            return provider.append_bytes(key, tail.as_bytes());
+        }
+    }
+    provider.write_bytes(key, updated.as_bytes())
+}
+
+/// Rewrites a Claude Desktop record so its `sessionId` matches the file it is stored in.
+fn with_desktop_session_id(content: &str, session_id: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(mut val) => {
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert(
+                    "sessionId".to_string(),
+                    serde_json::Value::String(session_id.to_string()),
+                );
+            }
+            serde_json::to_string(&val).unwrap_or_else(|_| content.to_string())
+        }
+        Err(_) => content.to_string(),
+    }
+}
+
+/// Folds `next` into `acc` without losing lines from either transcript.
+fn merge_into(acc: String, next: &str) -> String {
+    match merge_jsonl(&acc, next) {
+        MergeOutcome::Identical => acc,
+        MergeOutcome::LocalAhead(c) | MergeOutcome::RemoteAhead(c) => c,
+        MergeOutcome::Merged { content, .. } => content,
+    }
 }
 
 /// Writes a local file only if it hasn't changed since it was read (`expected` fingerprint;
@@ -375,14 +468,14 @@ impl SyncEngine {
     /// anything (safe for UI listing). Use [`SyncEngine::sync_all`] to persist the result.
     pub fn discover_projects(&mut self) -> Result<Vec<ProjectView>> {
         let provider = self.provider()?;
-        let (views, _) = self.discover_projects_internal(&provider, false)?;
+        let (views, _, _) = self.discover_projects_internal(&provider, false)?;
         Ok(views)
     }
 
     /// Lists projects and sessions with a single (read-only) discovery pass.
     pub fn overview(&mut self) -> Result<(Vec<ProjectView>, Vec<SessionSummary>)> {
         let provider = self.provider()?;
-        let (projects, _) = self.discover_projects_internal(&provider, false)?;
+        let (projects, _, _) = self.discover_projects_internal(&provider, false)?;
         let sessions = self.sessions_for(&provider, &projects)?;
         Ok((projects, sessions))
     }
@@ -393,7 +486,8 @@ impl SyncEngine {
         let local_projects = scan_local_projects(&config.claude_dir)?;
         let home_dir = self.effective_home_dir();
         let mut registry_dirty = false;
-        let mut config_dirty = false;
+        let mut unmapped_duplicates = dedupe_project_mappings(&mut config, &registry);
+        let mut config_dirty = !unmapped_duplicates.is_empty();
         let mut auto_mapped = 0usize;
 
         // Index existing local_project_paths by normalized path -> canonical_id
@@ -430,19 +524,33 @@ impl SyncEngine {
                         .cloned()
                         .unwrap_or_else(|| "local".to_string()),
                 )
-            } else if let Some(remote) = &lp.git_remote_normalized {
-                // 2. Auto-match via Git remote
-                if let Some(existing) = git_to_id.get(remote) {
-                    (existing.clone(), "git".to_string())
-                } else {
-                    (canonical_id_from_git(remote), "git".to_string())
-                }
             } else {
-                // 3. Fallback deterministic ID from display name
-                (
-                    canonical_id_from_name(&display_name_from_path(&local_path)),
-                    "folder-name".to_string(),
-                )
+                let (cid, source) = if let Some(remote) = &lp.git_remote_normalized {
+                    // 2. Auto-match via Git remote
+                    if let Some(existing) = git_to_id.get(remote) {
+                        (existing.clone(), "git".to_string())
+                    } else {
+                        (canonical_id_from_git(remote), "git".to_string())
+                    }
+                } else {
+                    // 3. Fallback deterministic ID from display name
+                    (
+                        canonical_id_from_name(&display_name_from_path(&local_path)),
+                        "folder-name".to_string(),
+                    )
+                };
+                // A second clone (or a same-named folder) must not steal the ID of a project that
+                // is already mapped to another existing folder; that flips the mapping back and
+                // forth on every sync and pulls the same sessions into both folders.
+                let taken_elsewhere = config.local_project_paths.get(&cid).is_some_and(|other| {
+                    normalize_windows_path(other).to_ascii_lowercase() != norm_key
+                        && Path::new(other).is_dir()
+                });
+                if taken_elsewhere {
+                    (canonical_id_from_name(&local_path), "folder-name".to_string())
+                } else {
+                    (cid, source)
+                }
             };
 
             if let Some(existing_proj) = registry.projects.get_mut(&canonical_id) {
@@ -519,6 +627,14 @@ impl SyncEngine {
             }
         }
 
+        unmapped_duplicates.extend(dedupe_project_mappings(&mut config, &registry));
+        if !unmapped_duplicates.is_empty() {
+            config_dirty = true;
+            for (removed, _) in &unmapped_duplicates {
+                local_counts.remove(removed);
+            }
+        }
+
         Ok(Reconciled {
             registry,
             registry_dirty,
@@ -526,6 +642,7 @@ impl SyncEngine {
             config_dirty,
             auto_mapped,
             local_counts,
+            unmapped_duplicates,
         })
     }
 
@@ -533,7 +650,7 @@ impl SyncEngine {
         &mut self,
         provider: &LocalFolderProvider,
         persist: bool,
-    ) -> Result<(Vec<ProjectView>, usize)> {
+    ) -> Result<Discovery> {
         let r = self.reconcile(provider)?;
 
         if persist {
@@ -599,12 +716,21 @@ impl SyncEngine {
                 .to_lowercase()
                 .cmp(&b.display_name.to_lowercase())
         });
-        Ok((views, r.auto_mapped))
+        Ok((views, r.auto_mapped, r.unmapped_duplicates))
     }
 
     /// Manually maps a canonical remote project to a local Windows folder on this PC.
     pub fn map_project_local_path(&mut self, canonical_id: &str, local_path: &str) -> Result<()> {
         let normalized = normalize_windows_path(local_path);
+        let key = normalized.to_ascii_lowercase();
+        if let Some((other, _)) = self.config.local_project_paths.iter().find(|(cid, p)| {
+            cid.as_str() != canonical_id && normalize_windows_path(p).to_ascii_lowercase() == key
+        }) {
+            return Err(SessionShareError::Config(format!(
+                "{} is already mapped to project {}. Mapping it to a second project would upload every session in that folder twice.",
+                normalized, other
+            )));
+        }
         self.config
             .local_project_paths
             .insert(canonical_id.to_string(), normalized);
@@ -763,7 +889,8 @@ impl SyncEngine {
         let _ = fs::create_dir_all(&self.config.claude_dir);
 
         let provider = self.provider()?;
-        let (projects, auto_mapped) = self.discover_projects_internal(&provider, true)?;
+        let (projects, auto_mapped, unmapped_duplicates) =
+            self.discover_projects_internal(&provider, true)?;
         report.auto_mapped = auto_mapped;
         if auto_mapped > 0 {
             activity(
@@ -775,6 +902,24 @@ impl SyncEngine {
                     auto_mapped
                 ),
             );
+        }
+        for (removed, kept) in &unmapped_duplicates {
+            activity(
+                &mut report,
+                "dedupe",
+                REGISTRY_PATH,
+                format!(
+                    "Project {} used the same folder as {}; it is no longer synced separately on this PC",
+                    removed, kept
+                ),
+            );
+        }
+
+        // 0.5 Collapse transcripts that were uploaded under more than one project.
+        if let Err(e) = self.dedupe_cross_project_sessions(&provider, &projects, &mut report) {
+            report
+                .errors
+                .push(format!("Duplicate session cleanup: {}", e));
         }
 
         // 1. Sync enabled & mapped projects
@@ -1179,7 +1324,7 @@ impl SyncEngine {
                             self.record(provider, &remote_key, &h, &local_path)?;
                         }
                         MergeOutcome::LocalAhead(merged_portable) => {
-                            provider.write_bytes(&remote_key, merged_portable.as_bytes())?;
+                            push_jsonl(provider, &remote_key, &remote_portable, &merged_portable)?;
                             let h = sha256_hex(merged_portable.as_bytes());
                             self.record(provider, &remote_key, &h, &local_path)?;
                             report.pushed += 1;
@@ -1297,7 +1442,7 @@ impl SyncEngine {
         mapped_roots.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
         // Group local desktop session files by canonical project ID.
-        let mut local_by_proj: HashMap<String, HashMap<String, &DesktopSessionFile>> = HashMap::new();
+        let mut local_by_proj: HashMap<String, HashMap<String, DesktopSessionFile>> = HashMap::new();
         for item in &local_all {
             let Some(cwd) = item.cwd.as_deref() else {
                 continue;
@@ -1314,7 +1459,7 @@ impl SyncEngine {
                 local_by_proj
                     .entry(proj.canonical_id.clone())
                     .or_default()
-                    .insert(item.filename.clone(), item);
+                    .insert(item.filename.clone(), item.clone());
             }
         }
 
@@ -1348,10 +1493,21 @@ impl SyncEngine {
                 }
             }
 
-            let empty_local: HashMap<String, &DesktopSessionFile> = HashMap::new();
-            let local_map = local_by_proj
-                .get(&proj.canonical_id)
-                .unwrap_or(&empty_local);
+            let mut local_map = local_by_proj
+                .remove(&proj.canonical_id)
+                .unwrap_or_default();
+            if local_map.is_empty() && remote_map.is_empty() {
+                continue;
+            }
+
+            self.dedupe_desktop_entries(
+                provider,
+                &remote_prefix,
+                &ctx,
+                &mut local_map,
+                &mut remote_map,
+                report,
+            )?;
 
             let local_set: BTreeSet<String> = local_map.keys().cloned().collect();
             let remote_set: BTreeSet<String> = remote_map.keys().cloned().collect();
@@ -1508,6 +1664,372 @@ impl SyncEngine {
             progress.finished(items.len(), report);
         }
 
+        Ok(())
+    }
+
+    /// Forgets all sync bookkeeping for a synced-drive key.
+    fn forget(&self, key: &str) -> Result<()> {
+        self.db.delete_state(key)?;
+        self.db.delete_base(key)?;
+        self.db.clear_conflict(key)
+    }
+
+    /// Claude Desktop on each PC can create its own sidebar record (`local_<uuid>.json`) for the
+    /// same Claude Code conversation, which then syncs everywhere as a duplicate entry. Records
+    /// sharing a `cliSessionId` are collapsed into one winner (oldest `createdAt`, then file name,
+    /// so every PC picks the same one) that carries the freshest metadata of all copies.
+    fn dedupe_desktop_entries(
+        &self,
+        provider: &dyn StorageProvider,
+        remote_prefix: &str,
+        ctx: &PathRewriteContext,
+        local_map: &mut HashMap<String, DesktopSessionFile>,
+        remote_map: &mut BTreeMap<String, (String, String, String)>,
+        report: &mut SyncReport,
+    ) -> Result<()> {
+        let grace = self.config.active_session_grace_secs;
+        let mut groups: BTreeMap<String, Vec<(String, Option<i64>)>> = BTreeMap::new();
+        let mut remote_only: HashMap<String, String> = HashMap::new();
+        for (name, loc) in local_map.iter() {
+            if let Some(cli) = &loc.cli_session_id {
+                groups
+                    .entry(cli.clone())
+                    .or_default()
+                    .push((name.clone(), loc.created_at));
+            }
+        }
+        for (name, (key, _, _)) in remote_map.iter() {
+            if local_map.contains_key(name) {
+                continue;
+            }
+            let Some(bytes) = provider.read_bytes(key)? else {
+                continue;
+            };
+            let content = lossy(bytes);
+            let (cli, created) = desktop_session_identity(&content);
+            remote_only.insert(name.clone(), content);
+            if let Some(cli) = cli {
+                groups.entry(cli).or_default().push((name.clone(), created));
+            }
+        }
+
+        for (cli, mut members) in groups {
+            if members.len() < 2 {
+                continue;
+            }
+            // Never touch a record Claude Desktop is writing right now; retry on a later sync.
+            if members.iter().any(|(n, _)| {
+                local_map
+                    .get(n)
+                    .is_some_and(|l| modified_within(&l.path, grace))
+            }) {
+                continue;
+            }
+            members.sort_by(|a, b| {
+                a.1.unwrap_or(i64::MAX)
+                    .cmp(&b.1.unwrap_or(i64::MAX))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let winner = members[0].0.clone();
+            let winner_id = winner.trim_end_matches(".json").to_string();
+
+            // Every local and synced copy in portable form, tagged with whether it is the winner's.
+            let mut versions: Vec<(String, bool)> = Vec::new();
+            for (name, _) in &members {
+                let is_winner = *name == winner;
+                if let Some(loc) = local_map.get(name) {
+                    if let Ok(raw) = read_with_retry(&loc.path) {
+                        versions.push((normalize_desktop_session_json(&lossy(raw), ctx), is_winner));
+                    }
+                }
+                if let Some(content) = remote_only.get(name) {
+                    versions.push((content.clone(), is_winner));
+                } else if let Some((key, _, _)) = remote_map.get(name) {
+                    if let Some(bytes) = provider.read_bytes(key)? {
+                        versions.push((lossy(bytes), is_winner));
+                    }
+                }
+            }
+            let Some((freshest, _)) = versions
+                .into_iter()
+                .max_by_key(|(c, is_winner)| (desktop_session_freshness(c), *is_winner))
+            else {
+                continue;
+            };
+            let merged = with_desktop_session_id(&freshest, &winner_id);
+
+            let local_template = local_map
+                .get(&winner)
+                .or_else(|| members.iter().find_map(|(n, _)| local_map.get(n)))
+                .cloned();
+            if let Some(template) = local_template {
+                // Apply locally; the regular pass below then uploads it if it is newer.
+                let winner_path = template.path.with_file_name(&winner);
+                let current_fp = local_fingerprint(&winner_path);
+                let current = match &current_fp {
+                    Some(_) => Some(normalize_desktop_session_json(
+                        &lossy(read_with_retry(&winner_path)?),
+                        ctx,
+                    )),
+                    None => None,
+                };
+                if current.as_deref() != Some(merged.as_str()) {
+                    let restored = denormalize_desktop_session_json(&merged, ctx);
+                    if !write_local_if_unchanged(&winner_path, restored.as_bytes(), &current_fp)? {
+                        continue;
+                    }
+                }
+                local_map.entry(winner.clone()).or_insert(DesktopSessionFile {
+                    filename: winner.clone(),
+                    path: winner_path,
+                    ..template
+                });
+            } else if let Some((key, _, _)) = remote_map.get(&winner) {
+                if remote_only.get(&winner).map(String::as_str) != Some(merged.as_str()) {
+                    provider.write_bytes(key, merged.as_bytes())?;
+                }
+            }
+
+            for (name, _) in members.iter().skip(1) {
+                let remote_key = remote_map.remove(name).map(|(k, _, _)| k);
+                let local = local_map.remove(name);
+                let key = remote_key.clone().unwrap_or_else(|| match &local {
+                    Some(l) => format!("{}/{}/{}/{}", remote_prefix, l.account_id, l.org_id, name),
+                    None => format!("{}/{}", remote_prefix, name),
+                });
+                if let Some(l) = local {
+                    let dest = self.trash_dir().join(&self.batch).join(rel_to_path(&key));
+                    move_file(&l.path, &dest)?;
+                }
+                if let Some(k) = &remote_key {
+                    provider.trash(k, &self.batch)?;
+                }
+                self.forget(&key)?;
+                report.deleted += 1;
+            }
+            activity(
+                report,
+                "dedupe",
+                &format!("{}/{}", remote_prefix, winner),
+                format!(
+                    "Removed {} duplicate Claude Desktop entr{} for conversation {} (kept {})",
+                    members.len() - 1,
+                    if members.len() == 2 { "y" } else { "ies" },
+                    cli,
+                    winner_id
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    /// A transcript ID is globally unique, so the same `<uuid>.jsonl` under several projects on the
+    /// synced drive means a PC once mapped one folder to several projects and uploaded it once per
+    /// project. Merges every copy into the best-ranked project, moves the extra copies (on the drive
+    /// and in this PC's duplicate folder) to trash, and moves matching Claude Desktop records along.
+    fn dedupe_cross_project_sessions(
+        &self,
+        provider: &dyn StorageProvider,
+        projects: &[ProjectView],
+        report: &mut SyncReport,
+    ) -> Result<()> {
+        let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for proj in projects {
+            let prefix = format!("projects/{}/sessions", proj.canonical_id);
+            for full in provider.list_files(&prefix)? {
+                if let Some(rel) = full.strip_prefix(&format!("{}/", prefix)) {
+                    if rel.ends_with(".jsonl") && !rel.contains(".conflict.") {
+                        owners
+                            .entry(rel.to_string())
+                            .or_default()
+                            .push(proj.canonical_id.clone());
+                    }
+                }
+            }
+        }
+        owners.retain(|_, cids| cids.len() > 1);
+        if owners.is_empty() {
+            return Ok(());
+        }
+
+        let registry = self.load_registry(provider)?;
+        for cids in owners.values_mut() {
+            cids.sort_by_key(|c| project_rank(&registry, c));
+        }
+        let synced_root = |cid: &str| -> Option<String> {
+            projects
+                .iter()
+                .find(|p| p.canonical_id == cid && p.sync_enabled)
+                .and_then(|p| p.local_path.clone())
+        };
+        let grace = self.config.active_session_grace_secs;
+
+        // Claude Desktop records stored under a losing project, by conversation ID.
+        let losers: BTreeSet<String> = owners
+            .values()
+            .flat_map(|cids| cids.iter().skip(1).cloned())
+            .collect();
+        let mut records: HashMap<String, Vec<RemoteDesktopRecord>> = HashMap::new();
+        for loser in &losers {
+            let prefix = format!("projects/{}/desktop-sessions", loser);
+            for full in provider.list_files(&prefix)? {
+                let Some(rel) = full.strip_prefix(&format!("{}/", prefix)) else {
+                    continue;
+                };
+                let parts: Vec<&str> = rel.split('/').collect();
+                if parts.len() != 3
+                    || !parts[2].starts_with("local_")
+                    || !parts[2].ends_with(".json")
+                    || parts[2].contains(".conflict.")
+                {
+                    continue;
+                }
+                let Some(bytes) = provider.read_bytes(&full)? else {
+                    continue;
+                };
+                let content = lossy(bytes);
+                if let (Some(cli), _) = desktop_session_identity(&content) {
+                    records.entry(cli).or_default().push(RemoteDesktopRecord {
+                        key: full.clone(),
+                        account_id: parts[0].to_string(),
+                        org_id: parts[1].to_string(),
+                        filename: parts[2].to_string(),
+                        content,
+                    });
+                }
+            }
+        }
+        let local_desktop: HashMap<String, DesktopSessionFile> = if records.is_empty()
+            || !self.config.global_options.desktop_sessions
+        {
+            HashMap::new()
+        } else {
+            self.effective_desktop_sessions_dir()
+                .filter(|d| d.is_dir())
+                .map(|d| scan_desktop_sessions(&d))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|d| (d.filename.clone(), d))
+                .collect()
+        };
+
+        for (rel, cids) in owners {
+            let winner = &cids[0];
+            let losers = &cids[1..];
+            let winner_root = synced_root(winner);
+            // Only consolidate where this PC can keep the session: if it syncs a losing project
+            // but not the winner, leave it for a PC that syncs the winner.
+            if winner_root.is_none() && losers.iter().any(|l| synced_root(l).is_some()) {
+                continue;
+            }
+            let related: Vec<&RemoteDesktopRecord> = if rel.contains('/') {
+                Vec::new()
+            } else {
+                rel.strip_suffix(".jsonl")
+                    .and_then(|cli| records.get(cli))
+                    .map(|v| v.iter().collect())
+                    .unwrap_or_default()
+            };
+
+            // This PC's copies inside the losing projects' folders.
+            let mut local_copies: Vec<(String, String, PathBuf)> = Vec::new();
+            for loser in losers {
+                if let Some(root) = synced_root(loser) {
+                    let path = resolve_encoded_project_dir(&self.config.claude_dir, &root)
+                        .join(rel_to_path(&rel));
+                    if path.is_file() {
+                        local_copies.push((loser.clone(), root, path));
+                    }
+                }
+            }
+            let busy = local_copies
+                .iter()
+                .any(|(_, _, p)| modified_within(p, grace))
+                || related.iter().any(|r| {
+                    local_desktop
+                        .get(&r.filename)
+                        .is_some_and(|d| modified_within(&d.path, grace))
+                });
+            if busy {
+                continue;
+            }
+
+            let winner_key = format!("projects/{}/sessions/{}", winner, rel);
+            let stored = provider.read_bytes(&winner_key)?.map(lossy).unwrap_or_default();
+            let mut merged = stored.clone();
+            for loser in losers {
+                let key = format!("projects/{}/sessions/{}", loser, rel);
+                if let Some(bytes) = provider.read_bytes(&key)? {
+                    merged = merge_into(merged, &lossy(bytes));
+                }
+            }
+            for (_, root, path) in &local_copies {
+                let raw = lossy(read_with_retry(path)?);
+                merged = merge_into(
+                    merged,
+                    &normalize_jsonl_with_ctx(&raw, &self.rewrite_ctx(Some(root))),
+                );
+            }
+            if merged != stored {
+                push_jsonl(provider, &winner_key, &stored, &merged)?;
+            }
+
+            for loser in losers {
+                let key = format!("projects/{}/sessions/{}", loser, rel);
+                provider.trash(&key, &self.batch)?;
+                self.forget(&key)?;
+            }
+            for (loser, _, path) in &local_copies {
+                let key = format!("projects/{}/sessions/{}", loser, rel);
+                move_file(path, &self.trash_dir().join(&self.batch).join(rel_to_path(&key)))?;
+                if let Some(dir) = path.parent() {
+                    let _ = fs::remove_file(dir.join("sessions-index.json"));
+                }
+            }
+            report.deleted += losers.len();
+            activity(
+                report,
+                "dedupe",
+                &winner_key,
+                format!(
+                    "Session was uploaded under {} projects ({}); kept one copy in {}",
+                    cids.len(),
+                    cids.join(", "),
+                    winner
+                ),
+            );
+
+            for rec in related {
+                let target = format!(
+                    "projects/{}/desktop-sessions/{}/{}/{}",
+                    winner, rec.account_id, rec.org_id, rec.filename
+                );
+                let existing = provider.read_bytes(&target)?.map(lossy);
+                let chosen = match &existing {
+                    Some(e)
+                        if desktop_session_freshness(e) >= desktop_session_freshness(&rec.content) =>
+                    {
+                        e.clone()
+                    }
+                    _ => rec.content.clone(),
+                };
+                if existing.as_deref() != Some(chosen.as_str()) {
+                    provider.write_bytes(&target, chosen.as_bytes())?;
+                }
+                provider.trash(&rec.key, &self.batch)?;
+                self.forget(&rec.key)?;
+                if let (Some(root), Some(local)) = (&winner_root, local_desktop.get(&rec.filename)) {
+                    // Point this PC's sidebar entry at the folder the transcript now lives in.
+                    let restored =
+                        denormalize_desktop_session_json(&chosen, &self.rewrite_ctx(Some(root)));
+                    let current = read_with_retry(&local.path).map(lossy).ok();
+                    if current.as_deref() != Some(restored.as_str()) {
+                        atomic_write(&local.path, restored.as_bytes())?;
+                    }
+                    self.record(provider, &target, &sha256_hex(chosen.as_bytes()), &local.path)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1693,7 +2215,7 @@ impl SyncEngine {
                 match merge_jsonl(&local_portable, &remote_portable) {
                     MergeOutcome::Identical => {}
                     MergeOutcome::LocalAhead(merged) => {
-                        provider.write_bytes(key, merged.as_bytes())?;
+                        push_jsonl(provider, key, &remote_portable, &merged)?;
                         report.pushed += 1;
                     }
                     MergeOutcome::RemoteAhead(merged) => {
@@ -2847,5 +3369,229 @@ mod tests {
                 .unwrap();
         assert_eq!(updated_a["title"], "Updated on B");
         assert_eq!(updated_a["cwd"], repo_a_str);
+    }
+
+    fn desktop_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = WalkDir::new(dir)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("local_"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn desktop_entries_for_the_same_conversation_collapse_into_one_on_every_pc() {
+        let pcs = TwoPcs::new();
+        let repo_a = pcs.tmp.path().join("a").join("Dev").join("App");
+        let repo_b = pcs.tmp.path().join("b").join("Dev").join("App");
+        fs::create_dir_all(&repo_b).unwrap();
+        write_project_session(&pcs.claude("a"), &repo_a, "cli-1.jsonl", &["u1"]);
+
+        // Each PC's Claude Desktop created its own sidebar record for conversation cli-1.
+        let record = |id: &str, cwd: &Path, created: i64, activity: i64, title: &str| {
+            serde_json::json!({
+                "sessionId": id,
+                "cliSessionId": "cli-1",
+                "cwd": normalize_windows_path(&cwd.to_string_lossy()),
+                "title": title,
+                "createdAt": created,
+                "lastActivityAt": activity,
+            })
+            .to_string()
+        };
+        let desktop_a = pcs.tmp.path().join("a").join("Desktop").join("claude-code-sessions");
+        let desktop_b = pcs.tmp.path().join("b").join("Desktop").join("claude-code-sessions");
+        let org_a = desktop_a.join("acc").join("org");
+        let org_b = desktop_b.join("acc").join("org");
+        fs::create_dir_all(&org_a).unwrap();
+        fs::create_dir_all(&org_b).unwrap();
+        fs::write(org_a.join("local_a.json"), record("local_a", &repo_a, 100, 1000, "Old")).unwrap();
+        fs::write(org_b.join("local_b.json"), record("local_b", &repo_b, 101, 5000, "Newest")).unwrap();
+
+        let mut a = pcs.engine("a", |c| {
+            c.claude_desktop_dir = Some(desktop_a.clone());
+            c.active_session_grace_secs = 0;
+        });
+        let mut b = pcs.engine("b", |c| {
+            c.claude_desktop_dir = Some(desktop_b.clone());
+            c.active_session_grace_secs = 0;
+        });
+        a.sync_all().unwrap();
+        let rep_b = b.sync_all().unwrap();
+        assert!(rep_b.activities.iter().any(|x| x.kind == "dedupe"));
+        a.sync_all().unwrap();
+
+        // One entry everywhere: the oldest record's ID, carrying the freshest metadata.
+        assert_eq!(desktop_files(&desktop_a), vec!["local_a.json"]);
+        assert_eq!(desktop_files(&desktop_b), vec!["local_a.json"]);
+        assert_eq!(desktop_files(&pcs.sync.join("projects")), vec!["local_a.json"]);
+        for org in [&org_a, &org_b] {
+            let v: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(org.join("local_a.json")).unwrap()).unwrap();
+            assert_eq!(v["sessionId"], "local_a");
+            assert_eq!(v["title"], "Newest");
+        }
+
+        // Stable afterwards: nothing is re-uploaded or resurrected.
+        for engine in [&mut a, &mut b] {
+            let rep = engine.sync_all().unwrap();
+            assert_eq!(rep.pushed + rep.pulled + rep.merged + rep.deleted, 0);
+        }
+    }
+
+    #[test]
+    fn folder_mapped_to_two_projects_is_uploaded_once_and_existing_copies_are_merged() {
+        let pcs = TwoPcs::new();
+        let repo = pcs.tmp.path().join("a").join("Dev").join("App");
+        let repo_s = normalize_windows_path(&repo.to_string_lossy());
+        write_project_session(&pcs.claude("a"), &repo, "s1.jsonl", &["u1", "u22"]);
+        let mut a = pcs.engine("a", |c| c.active_session_grace_secs = 0);
+        a.sync_all().unwrap();
+        let first_id = a.config().local_project_paths.keys().next().unwrap().clone();
+
+        // Legacy state: a Git-identified project for the same folder, with its own (partial) copy.
+        let mut registry: Registry =
+            serde_json::from_slice(&fs::read(pcs.sync.join(REGISTRY_PATH)).unwrap()).unwrap();
+        let mut twin = registry.projects[&first_id].clone();
+        twin.id = "git-0123456789ab".to_string();
+        registry.projects.insert(twin.id.clone(), twin);
+        fs::write(pcs.sync.join(REGISTRY_PATH), serde_json::to_vec(&registry).unwrap()).unwrap();
+        let first_copy = pcs.sync.join("projects").join(&first_id).join("sessions").join("s1.jsonl");
+        let first_line = fs::read_to_string(&first_copy).unwrap().lines().next().unwrap().to_string();
+        let twin_copy = pcs.sync.join("projects").join("git-0123456789ab").join("sessions").join("s1.jsonl");
+        fs::create_dir_all(twin_copy.parent().unwrap()).unwrap();
+        fs::write(&twin_copy, format!("{}\n", first_line)).unwrap();
+        let mut cfg = a.config().clone();
+        cfg.local_project_paths.insert("git-0123456789ab".to_string(), repo_s.clone());
+        cfg.project_sync_enabled.insert("git-0123456789ab".to_string(), true);
+        a.update_config(cfg).unwrap();
+
+        let rep = a.sync_all().unwrap();
+        assert!(rep.activities.iter().any(|x| x.kind == "dedupe"));
+        assert_eq!(a.config().local_project_paths.len(), 1);
+        assert_eq!(a.config().local_project_paths["git-0123456789ab"], repo_s);
+        assert!(!first_copy.exists());
+        assert_eq!(fs::read_to_string(&twin_copy).unwrap().lines().count(), 2);
+
+        // Mapping a second project onto the same folder is refused.
+        assert!(a.map_project_local_path(&first_id, &repo_s).is_err());
+        let rep = a.sync_all().unwrap();
+        assert_eq!(rep.pushed + rep.pulled + rep.merged + rep.deleted, 0);
+        assert!(!first_copy.exists());
+    }
+
+    #[test]
+    fn session_uploaded_under_two_projects_moves_to_one_with_its_desktop_entry() {
+        let pcs = TwoPcs::new();
+        let home = pcs.tmp.path().join("a");
+        let repo_1 = home.join("Dev").join("App");
+        let repo_2 = home.join("Old").join("AppCopy");
+        write_project_session(&pcs.claude("a"), &repo_1, "s1.jsonl", &["u1"]);
+        write_project_session(&pcs.claude("a"), &repo_2, "other.jsonl", &["o1"]);
+        let desktop = home.join("Desktop").join("claude-code-sessions");
+        let org = desktop.join("acc").join("org");
+        fs::create_dir_all(&org).unwrap();
+        let mut a = pcs.engine("a", |c| {
+            c.claude_desktop_dir = Some(desktop.clone());
+            c.active_session_grace_secs = 0;
+        });
+        a.sync_all().unwrap();
+
+        let registry: Registry =
+            serde_json::from_slice(&fs::read(pcs.sync.join(REGISTRY_PATH)).unwrap()).unwrap();
+        let path_of = |cid: &str| a.config().local_project_paths[cid].clone();
+        let mut ids: Vec<String> = a.config().local_project_paths.keys().cloned().collect();
+        ids.sort_by_key(|c| project_rank(&registry, c));
+        let (winner, loser) = (ids[0].clone(), ids[1].clone());
+        let (winner_root, loser_root) = (path_of(&winner), path_of(&loser));
+
+        // Legacy state: another PC uploaded the winner's session into the loser project too, this
+        // PC pulled it into the loser's folder, and its sidebar entry points at that folder.
+        let session_of = |cid: &str| pcs.sync.join("projects").join(cid).join("sessions").join("s1.jsonl");
+        let loser_local = resolve_encoded_project_dir(&pcs.claude("a"), &loser_root).join("s1.jsonl");
+        let winner_local = resolve_encoded_project_dir(&pcs.claude("a"), &winner_root).join("s1.jsonl");
+        fs::copy(&winner_local, &loser_local).unwrap();
+        fs::write(
+            org.join("local_x.json"),
+            serde_json::json!({"sessionId": "local_x", "cliSessionId": "s1", "cwd": loser_root, "createdAt": 1})
+                .to_string(),
+        )
+        .unwrap();
+        a.sync_all().unwrap();
+        let wrapper_of = |cid: &str| {
+            pcs.sync.join("projects").join(cid).join("desktop-sessions").join("acc").join("org").join("local_x.json")
+        };
+        assert!(session_of(&loser).is_file());
+        assert!(wrapper_of(&loser).is_file());
+
+        let rep = a.sync_all().unwrap();
+        assert!(rep.activities.iter().any(|x| x.kind == "dedupe"));
+        assert!(session_of(&winner).is_file());
+        assert!(!session_of(&loser).exists());
+        assert!(winner_local.is_file());
+        assert!(!loser_local.exists());
+        assert!(wrapper_of(&winner).is_file());
+        assert!(!wrapper_of(&loser).exists());
+        let local: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(org.join("local_x.json")).unwrap()).unwrap();
+        assert_eq!(local["cwd"], winner_root);
+
+        let rep = a.sync_all().unwrap();
+        assert_eq!(rep.pushed + rep.pulled + rep.merged + rep.deleted, 0);
+        assert!(!session_of(&loser).exists());
+        assert!(!wrapper_of(&loser).exists());
+    }
+
+    #[test]
+    fn grown_transcript_is_appended_instead_of_rewritten() {
+        struct Recorder {
+            inner: LocalFolderProvider,
+            writes: std::sync::Mutex<usize>,
+        }
+        impl StorageProvider for Recorder {
+            fn exists(&self, p: &str) -> bool {
+                self.inner.exists(p)
+            }
+            fn read_bytes(&self, p: &str) -> Result<Option<Vec<u8>>> {
+                self.inner.read_bytes(p)
+            }
+            fn write_bytes(&self, p: &str, b: &[u8]) -> Result<()> {
+                *self.writes.lock().unwrap() += 1;
+                self.inner.write_bytes(p, b)
+            }
+            fn append_bytes(&self, p: &str, b: &[u8]) -> Result<()> {
+                self.inner.append_bytes(p, b)
+            }
+            fn list_files(&self, p: &str) -> Result<Vec<String>> {
+                self.inner.list_files(p)
+            }
+            fn modified_time(&self, p: &str) -> Option<SystemTime> {
+                self.inner.modified_time(p)
+            }
+            fn fingerprint(&self, p: &str) -> Option<String> {
+                self.inner.fingerprint(p)
+            }
+            fn trash(&self, p: &str, b: &str) -> Result<()> {
+                self.inner.trash(p, b)
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let rec = Recorder {
+            inner: LocalFolderProvider::new(tmp.path().to_path_buf()).unwrap(),
+            writes: std::sync::Mutex::new(0),
+        };
+        rec.inner.write_bytes("s.jsonl", b"a\n").unwrap();
+        push_jsonl(&rec, "s.jsonl", "a\n", "a\nb\n").unwrap();
+        assert_eq!(*rec.writes.lock().unwrap(), 0);
+        assert_eq!(fs::read_to_string(tmp.path().join("s.jsonl")).unwrap(), "a\nb\n");
+
+        // Anything other than a pure append rewrites the file.
+        push_jsonl(&rec, "s.jsonl", "a\nb\n", "x\na\nb\n").unwrap();
+        assert_eq!(*rec.writes.lock().unwrap(), 1);
+        assert_eq!(fs::read_to_string(tmp.path().join("s.jsonl")).unwrap(), "x\na\nb\n");
     }
 }

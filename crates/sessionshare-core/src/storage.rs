@@ -146,6 +146,13 @@ pub trait StorageProvider: Send + Sync {
     fn exists(&self, rel_path: &str) -> bool;
     fn read_bytes(&self, rel_path: &str) -> Result<Option<Vec<u8>>>;
     fn write_bytes(&self, rel_path: &str, bytes: &[u8]) -> Result<()>;
+    /// Appends `bytes` to an existing stored file in place, so drives that sync differentially
+    /// only transfer the new tail instead of the whole file.
+    fn append_bytes(&self, rel_path: &str, bytes: &[u8]) -> Result<()> {
+        let mut all = self.read_bytes(rel_path)?.unwrap_or_default();
+        all.extend_from_slice(bytes);
+        self.write_bytes(rel_path, &all)
+    }
     fn list_files(&self, rel_prefix: &str) -> Result<Vec<String>>;
     fn modified_time(&self, rel_path: &str) -> Option<std::time::SystemTime>;
     /// Change-detection fingerprint (size + mtime) of a stored file, if it exists.
@@ -198,6 +205,30 @@ impl StorageProvider for LocalFolderProvider {
     fn write_bytes(&self, rel_path: &str, bytes: &[u8]) -> Result<()> {
         let p = self.resolve(rel_path);
         atomic_write(&p, bytes)
+    }
+
+    fn append_bytes(&self, rel_path: &str, bytes: &[u8]) -> Result<()> {
+        let p = self.resolve(rel_path);
+        let mut last_err = None;
+        for attempt in 0..RENAME_ATTEMPTS {
+            match fs::OpenOptions::new().append(true).open(&p) {
+                Ok(mut f) => {
+                    f.write_all(bytes)?;
+                    f.sync_all()?;
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return atomic_write(&p, bytes);
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    thread::sleep(Duration::from_millis(50 * (attempt as u64 + 1)));
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| std::io::Error::other("append failed"))
+            .into())
     }
 
     fn list_files(&self, rel_prefix: &str) -> Result<Vec<String>> {
