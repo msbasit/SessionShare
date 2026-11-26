@@ -251,7 +251,9 @@
   <div class="titlebar" data-tauri-drag-region>
     <div class="titlebar-name" data-tauri-drag-region>
       <svg class="titlebar-mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-        <path d="M5 8.5h11.5l-3-3M19 15.5H7.5l3 3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+        <rect x="8.5" y="3.5" width="12" height="10" rx="2.5" stroke="currentColor" stroke-width="1.8" opacity="0.55" />
+        <rect x="3.5" y="9.5" width="13" height="11" rx="2.5" fill="var(--titlebar)" stroke="currentColor" stroke-width="1.8" />
+        <path d="M7.2 13.3 9.7 15.2 7.2 17.1M11.2 17.1h2.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
       </svg>
       <span data-tauri-drag-region>SessionShare</span>
     </div>
@@ -275,7 +277,11 @@
   <header class="topbar">
     <div class="brand">
       <div class="brand-mark" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none"><path d="M4 8h13l-3.5-3.5M20 16H7l3.5 3.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        <svg viewBox="0 0 24 24" fill="none">
+          <rect x="8.5" y="3.5" width="12" height="10" rx="2.5" stroke="currentColor" stroke-width="1.9" opacity="0.55" />
+          <rect x="3.5" y="9.5" width="13" height="11" rx="2.5" fill="var(--accent-strong)" stroke="currentColor" stroke-width="1.9" />
+          <path d="M7.2 13.3 9.7 15.2 7.2 17.1M11.2 17.1h2.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
       </div>
       <div>
         <h1>SessionShare</h1>

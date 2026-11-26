@@ -1,4 +1,31 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 24 24">
-  <rect x="1" y="1" width="22" height="22" rx="4" fill="#345fc0"/>
-  <path d="M4.5 8h13l-3.5-3.5M19.5 16h-13l3.5 3.5" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4A7CF7"/>
+      <stop offset="55%" stop-color="#2D57C4"/>
+      <stop offset="100%" stop-color="#1E3C8F"/>
+    </linearGradient>
+    <linearGradient id="backCard" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#B9D3FF"/>
+      <stop offset="100%" stop-color="#88B2FF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- App tile -->
+  <rect x="44" y="44" width="936" height="936" rx="224" fill="url(#bg)"/>
+  <rect x="56" y="56" width="912" height="912" rx="212" fill="none" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="14"/>
+
+  <!-- Back synced session card -->
+  <rect x="356" y="192" width="468" height="396" rx="92" fill="url(#backCard)"/>
+  <rect x="444" y="286" width="244" height="46" rx="23" fill="#FFFFFF" fill-opacity="0.88"/>
+
+  <!-- Separation halo behind front card for crisp legibility at small tray sizes -->
+  <rect x="184" y="404" width="536" height="444" rx="112" fill="#2346A0" fill-opacity="0.85"/>
+
+  <!-- Front active Claude Code session card -->
+  <rect x="204" y="424" width="496" height="404" rx="96" fill="#FFFFFF"/>
+
+  <!-- Terminal prompt >_ -->
+  <path d="M320 546 L422 626 L320 706" fill="none" stroke="#2851B5" stroke-width="64" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M466 706 L584 706" fill="none" stroke="#2851B5" stroke-width="64" stroke-linecap="round"/>
 </svg>
