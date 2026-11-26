@@ -31,6 +31,31 @@ enum Commands {
     },
     /// Run a bidirectional sync now
     Sync,
+    /// List incoming hook / permission changes waiting for approval
+    Pending,
+    /// Approve the pending incoming change for a synced file (e.g. global/settings.json)
+    Approve { remote_key: String },
+    /// Reject the pending incoming change for a synced file
+    Reject { remote_key: String },
+    /// List files changed differently on both PCs (held until merged)
+    Conflicts,
+    /// Resolve a held conflict by keeping one PC's version on both PCs
+    Keep {
+        remote_key: String,
+        /// `local` (this PC) or `remote` (other PC)
+        #[arg(long, value_parser = ["local", "remote"])]
+        side: String,
+    },
+}
+
+fn resolve(engine: &SyncEngine, remote_key: &str, approve: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let pending = engine.pending_approvals()?;
+    let item = pending
+        .iter()
+        .find(|p| p.remote_key == remote_key)
+        .ok_or_else(|| format!("No pending change for {}", remote_key))?;
+    engine.resolve_approval(&item.remote_key, &item.remote_hash, approve)?;
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -72,6 +97,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut engine = SyncEngine::new(app_data, cfg)?;
             let report = engine.sync_all()?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Commands::Pending => {
+            let engine = SyncEngine::new(app_data, cfg)?;
+            println!("{}", serde_json::to_string_pretty(&engine.pending_approvals()?)?);
+        }
+        Commands::Approve { remote_key } => {
+            let engine = SyncEngine::new(app_data, cfg)?;
+            resolve(&engine, &remote_key, true)?;
+            println!("Approved {}; it will be applied on the next sync.", remote_key);
+        }
+        Commands::Reject { remote_key } => {
+            let engine = SyncEngine::new(app_data, cfg)?;
+            resolve(&engine, &remote_key, false)?;
+            println!("Rejected {}.", remote_key);
+        }
+        Commands::Conflicts => {
+            let engine = SyncEngine::new(app_data, cfg)?;
+            println!("{}", serde_json::to_string_pretty(&engine.conflicts()?)?);
+        }
+        Commands::Keep { remote_key, side } => {
+            let engine = SyncEngine::new(app_data, cfg)?;
+            let view = engine.conflict_view(&remote_key)?;
+            let content = if side == "local" { &view.local_text } else { &view.remote_text };
+            engine.resolve_conflict(&remote_key, &view.local_hash, &view.remote_hash, content)?;
+            println!("Kept the {} version of {} on both PCs.", side, remote_key);
         }
     }
 

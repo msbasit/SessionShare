@@ -23,6 +23,30 @@ export interface AppConfig {
   project_sync_enabled: Record<string, boolean>;
   local_project_paths: Record<string, string>;
   mapping_sources: Record<string, string>;
+  periodic_sync_mins: number;
+  active_session_grace_secs: number;
+  propagate_deletions: boolean;
+  require_hook_approval: boolean;
+  settings_excluded_keys: string[];
+  retention_days: number;
+  launch_at_login: boolean;
+}
+
+export interface SettingsPayload {
+  machine_name: string;
+  claude_dir: string;
+  sync_dir: string | null;
+  auto_sync: boolean;
+  debounce_secs: number;
+  workspace_roots: string[];
+  global_options: GlobalSyncOptions;
+  periodic_sync_mins: number;
+  active_session_grace_secs: number;
+  propagate_deletions: boolean;
+  require_hook_approval: boolean;
+  settings_excluded_keys: string[];
+  retention_days: number;
+  launch_at_login: boolean;
 }
 
 export interface ProjectView {
@@ -59,12 +83,26 @@ export interface ActivityEntry {
   detail: string;
 }
 
+export interface SyncProgress {
+  phase: string;
+  current_item: string | null;
+  checked: number;
+  completed: number;
+  total: number;
+  upcoming: string[];
+  recent: ActivityEntry[];
+}
+
 export interface SyncReport {
   timestamp: string;
   pushed: number;
   pulled: number;
   merged: number;
   auto_mapped: number;
+  deleted: number;
+  deferred: number;
+  pending_approvals: number;
+  unresolved_conflicts: number;
   conflicts: string[];
   errors: string[];
   activities: ActivityEntry[];
@@ -76,4 +114,54 @@ export interface SyncStatus {
   is_syncing: boolean;
   machine_name: string;
   last_report: SyncReport | null;
+  sync_generation: number;
+  progress: SyncProgress | null;
+  watcher_active: boolean;
+  watcher_error: string | null;
+  pending_approvals: number;
+}
+
+export interface PendingApproval {
+  remote_key: string;
+  remote_hash: string;
+  detected_at: string;
+  summary: string;
+  preview: string;
+}
+
+export interface MergeConflict {
+  remote_key: string;
+  local_path: string;
+  local_hash: string;
+  remote_hash: string;
+  has_base: boolean;
+  detected_at: string;
+}
+
+export interface Chunk {
+  stable: boolean;
+  base: string[] | null;
+  local: string[];
+  remote: string[];
+  auto: "local" | "remote" | null;
+}
+
+export interface ConflictView {
+  remote_key: string;
+  local_path: string;
+  kind: "text" | "json";
+  has_base: boolean;
+  local_hash: string;
+  remote_hash: string;
+  local_text: string;
+  remote_text: string;
+  chunks: Chunk[];
+}
+
+export interface Overview {
+  projects: ProjectView[];
+  sessions: SessionSummary[];
+  activities: ActivityEntry[];
+  pending_approvals: PendingApproval[];
+  conflicts: MergeConflict[];
 }

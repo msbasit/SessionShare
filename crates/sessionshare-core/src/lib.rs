@@ -1,8 +1,10 @@
 pub mod claude_fs;
 pub mod error;
+pub mod merge3;
 pub mod merger;
 pub mod models;
 pub mod path_rewrite;
+pub mod settings;
 pub mod state_db;
 pub mod storage;
 pub mod sync_engine;

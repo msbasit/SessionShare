@@ -61,6 +61,43 @@ pub struct AppConfig {
     /// How each local mapping was resolved ("git", "home-relative", "workspace-scan", "folder-name", "manual")
     #[serde(default)]
     pub mapping_sources: BTreeMap<String, String>,
+    /// Fallback full sync interval in minutes when auto-sync is on (0 = disabled).
+    #[serde(default = "default_periodic_sync_mins")]
+    pub periodic_sync_mins: u64,
+    /// Transcripts modified within this many seconds are treated as active and never rewritten locally.
+    #[serde(default = "default_active_session_grace_secs")]
+    pub active_session_grace_secs: u64,
+    /// Propagate deletions between PCs (deleted files are moved to a trash folder, not erased).
+    #[serde(default = "default_true")]
+    pub propagate_deletions: bool,
+    /// Incoming hook / permission / command changes require approval before being applied.
+    #[serde(default = "default_true")]
+    pub require_hook_approval: bool,
+    /// Top-level `settings.json` keys that never leave this PC (e.g. `env` holding API keys).
+    #[serde(default = "default_settings_excluded_keys")]
+    pub settings_excluded_keys: Vec<String>,
+    /// Days to keep trash and conflict backups before they are purged.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
+    /// Start SessionShare (minimized to tray) when signing in to Windows.
+    #[serde(default)]
+    pub launch_at_login: bool,
+}
+
+fn default_periodic_sync_mins() -> u64 {
+    5
+}
+
+fn default_active_session_grace_secs() -> u64 {
+    30
+}
+
+fn default_settings_excluded_keys() -> Vec<String> {
+    vec!["env".to_string()]
+}
+
+fn default_retention_days() -> u64 {
+    30
 }
 
 impl AppConfig {
@@ -80,6 +117,13 @@ impl AppConfig {
             project_sync_enabled: BTreeMap::new(),
             local_project_paths: BTreeMap::new(),
             mapping_sources: BTreeMap::new(),
+            periodic_sync_mins: default_periodic_sync_mins(),
+            active_session_grace_secs: default_active_session_grace_secs(),
+            propagate_deletions: true,
+            require_hook_approval: true,
+            settings_excluded_keys: default_settings_excluded_keys(),
+            retention_days: default_retention_days(),
+            launch_at_login: false,
         }
     }
 }
@@ -150,13 +194,75 @@ pub struct ActivityEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SyncProgress {
+    pub phase: String,
+    pub current_item: Option<String>,
+    pub checked: usize,
+    pub completed: usize,
+    pub total: usize,
+    pub upcoming: Vec<String>,
+    pub recent: Vec<ActivityEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyncReport {
     pub timestamp: DateTime<Utc>,
     pub pushed: usize,
     pub pulled: usize,
     pub merged: usize,
     pub auto_mapped: usize,
+    /// Files moved to trash because they were deleted on the other side.
+    #[serde(default)]
+    pub deleted: usize,
+    /// Local writes postponed because the file is in active use (e.g. a running Claude session).
+    #[serde(default)]
+    pub deferred: usize,
+    /// Number of incoming changes waiting for user approval.
+    #[serde(default)]
+    pub pending_approvals: usize,
+    /// Files changed differently on both PCs, held untouched until merged in the Review tab.
+    #[serde(default)]
+    pub unresolved_conflicts: usize,
     pub conflicts: Vec<String>,
     pub errors: Vec<String>,
     pub activities: Vec<ActivityEntry>,
+}
+
+/// An incoming change (hook script or settings.json hooks/permissions) held until the user approves it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingApproval {
+    pub remote_key: String,
+    pub remote_hash: String,
+    pub detected_at: DateTime<Utc>,
+    pub summary: String,
+    /// Incoming content (truncated) so the user can review it.
+    pub preview: String,
+}
+
+/// A file changed differently on both PCs; both copies are left untouched until the user merges.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MergeConflict {
+    pub remote_key: String,
+    pub local_path: String,
+    pub local_hash: String,
+    pub remote_hash: String,
+    /// Whether the version both PCs last agreed on is known (enables automatic pre-merging).
+    pub has_base: bool,
+    pub detected_at: DateTime<Utc>,
+}
+
+/// Everything the merge editor needs: both sides, the diff chunks, and hashes that guard
+/// against saving a merge after either file changed again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictView {
+    pub remote_key: String,
+    pub local_path: String,
+    /// `"json"` for settings.json (result must be valid JSON), otherwise `"text"`.
+    pub kind: String,
+    pub has_base: bool,
+    pub local_hash: String,
+    pub remote_hash: String,
+    pub local_text: String,
+    pub remote_text: String,
+    pub chunks: Vec<crate::merge3::Chunk>,
 }
