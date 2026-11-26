@@ -1,8 +1,9 @@
 use crate::claude_fs::{
     auto_resolve_unmapped_project, canonical_id_from_git, canonical_id_from_name,
-    compute_home_relative_hint, default_home_dir, display_name_from_path, encode_project_path,
-    inspect_session_file, normalize_windows_path, resolve_encoded_project_dir, scan_local_projects,
-    SessionFileMeta,
+    compute_home_relative_hint, default_desktop_account_org, default_home_dir,
+    display_name_from_path, encode_project_path, inspect_session_file, normalize_windows_path,
+    resolve_claude_desktop_sessions_dir, resolve_encoded_project_dir, scan_desktop_sessions,
+    scan_local_projects, DesktopSessionFile, SessionFileMeta,
 };
 use crate::error::{Result, SessionShareError};
 use crate::merge3::{auto_result, merge2, merge3};
@@ -12,7 +13,8 @@ use crate::models::{
     PendingApproval, ProjectView, Registry, SessionSummary, SyncProgress, SyncReport,
 };
 use crate::path_rewrite::{
-    denormalize_history_jsonl, denormalize_jsonl_with_ctx, denormalize_settings_json,
+    denormalize_desktop_session_json, denormalize_history_jsonl, denormalize_jsonl_with_ctx,
+    denormalize_settings_json, desktop_session_freshness, normalize_desktop_session_json,
     normalize_history_jsonl, normalize_jsonl_with_ctx, normalize_settings_json, PathRewriteContext,
 };
 use crate::settings::{command_signature, has_any_key, json_merge3, reinject_keys, strip_keys};
@@ -228,6 +230,16 @@ impl SyncEngine {
 
     fn effective_home_dir(&self) -> Option<String> {
         self.home_dir_override.clone().or_else(default_home_dir)
+    }
+
+    /// Returns the effective Claude Desktop `claude-code-sessions` directory.
+    /// In isolated tests (`home_dir_override` set), only uses an explicitly configured
+    /// `claude_desktop_dir` so tests never touch the host machine's real Claude Desktop data.
+    pub fn effective_desktop_sessions_dir(&self) -> Option<PathBuf> {
+        if self.home_dir_override.is_some() && self.config.claude_desktop_dir.is_none() {
+            return None;
+        }
+        resolve_claude_desktop_sessions_dir(self.config.claude_desktop_dir.as_deref())
     }
 
     fn rewrite_ctx(&self, project_root: Option<&str>) -> PathRewriteContext {
@@ -803,6 +815,25 @@ impl SyncEngine {
             }
         }
 
+        // 1.5 Sync Claude Desktop sidebar session manifests (`claude-code-sessions`)
+        if self.config.global_options.desktop_sessions {
+            if let Some(desktop_root) = self.effective_desktop_sessions_dir() {
+                if desktop_root.is_dir() {
+                    if let Err(e) = self.sync_desktop_sessions(
+                        &provider,
+                        &desktop_root,
+                        &projects,
+                        &mut report,
+                        &mut progress,
+                    ) {
+                        report
+                            .errors
+                            .push(format!("Claude Desktop sessions: {}", e));
+                    }
+                }
+            }
+        }
+
         // 2. Sync global directories (missing dirs on either PC are handled seamlessly)
         let opts = self.config.global_options.clone();
         let global_dirs: [(&str, bool); 6] = [
@@ -1231,6 +1262,250 @@ impl SyncEngine {
             if idx.is_file() {
                 let _ = fs::remove_file(idx);
             }
+        }
+
+        Ok(())
+    }
+
+    /// Syncs Claude Desktop's `claude-code-sessions/<account_id>/<org_id>/local_*.json` manifests
+    /// for all mapped, sync-enabled projects, rewriting local project/home paths portably and
+    /// mapping into this PC's matching (or active) `<account_id>/<org_id>` folder.
+    fn sync_desktop_sessions(
+        &self,
+        provider: &dyn StorageProvider,
+        desktop_root: &Path,
+        projects: &[ProjectView],
+        report: &mut SyncReport,
+        progress: &mut ProgressReporter<'_>,
+    ) -> Result<()> {
+        progress.scanning("Finding Claude Desktop sessions".to_string(), report);
+        let local_all = scan_desktop_sessions(desktop_root);
+        let default_target = default_desktop_account_org(desktop_root);
+        let grace = self.config.active_session_grace_secs;
+
+        // Build normalized project roots ordered longest-first so nested repos match specifically.
+        let mut mapped_roots: Vec<(&ProjectView, String)> = projects
+            .iter()
+            .filter_map(|p| {
+                if !p.sync_enabled {
+                    return None;
+                }
+                let root = p.local_path.as_deref()?;
+                Some((p, normalize_windows_path(root).to_ascii_lowercase()))
+            })
+            .collect();
+        mapped_roots.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+        // Group local desktop session files by canonical project ID.
+        let mut local_by_proj: HashMap<String, HashMap<String, &DesktopSessionFile>> = HashMap::new();
+        for item in &local_all {
+            let Some(cwd) = item.cwd.as_deref() else {
+                continue;
+            };
+            let cwd_lower = normalize_windows_path(cwd).to_ascii_lowercase();
+            let matched = mapped_roots.iter().find(|(_, root_lower)| {
+                cwd_lower == *root_lower
+                    || cwd_lower
+                        .strip_prefix(root_lower.as_str())
+                        .map(|rest| rest.starts_with('\\'))
+                        .unwrap_or(false)
+            });
+            if let Some((proj, _)) = matched {
+                local_by_proj
+                    .entry(proj.canonical_id.clone())
+                    .or_default()
+                    .insert(item.filename.clone(), item);
+            }
+        }
+
+        for proj in projects {
+            if !proj.sync_enabled {
+                continue;
+            }
+            let Some(local_root) = &proj.local_path else {
+                continue;
+            };
+            let remote_prefix = format!("projects/{}/desktop-sessions", proj.canonical_id);
+            let ctx = self.rewrite_ctx(Some(local_root));
+
+            // Index remote desktop session files by filename (`local_<uuid>.json`).
+            let mut remote_map: BTreeMap<String, (String, String, String)> = BTreeMap::new();
+            for remote_full in provider.list_files(&remote_prefix)? {
+                let Some(rel) = remote_full.strip_prefix(&format!("{}/", remote_prefix)) else {
+                    continue;
+                };
+                let parts: Vec<&str> = rel.split('/').collect();
+                if parts.len() == 3
+                    && parts[2].starts_with("local_")
+                    && parts[2].ends_with(".json")
+                    && !parts[2].contains(".conflict.")
+                {
+                    remote_map
+                        .entry(parts[2].to_string())
+                        .or_insert_with(|| {
+                            (remote_full.clone(), parts[0].to_string(), parts[1].to_string())
+                        });
+                }
+            }
+
+            let empty_local: HashMap<String, &DesktopSessionFile> = HashMap::new();
+            let local_map = local_by_proj
+                .get(&proj.canonical_id)
+                .unwrap_or(&empty_local);
+
+            let local_set: BTreeSet<String> = local_map.keys().cloned().collect();
+            let remote_set: BTreeSet<String> = remote_map.keys().cloned().collect();
+            if local_set.is_empty() && remote_set.is_empty() {
+                continue;
+            }
+
+            let key_of = |filename: &str| -> String {
+                if let Some((rk, _, _)) = remote_map.get(filename) {
+                    rk.clone()
+                } else if let Some(loc) = local_map.get(filename) {
+                    format!("{}/{}/{}/{}", remote_prefix, loc.account_id, loc.org_id, filename)
+                } else {
+                    format!("{}/{}", remote_prefix, filename)
+                }
+            };
+
+            let allow_deletes = self.deletions_allowed(
+                &format!("Project {} desktop sessions", proj.canonical_id),
+                &local_set,
+                &remote_set,
+                &key_of,
+                report,
+            );
+
+            let all: Vec<String> = local_set.union(&remote_set).cloned().collect();
+            let items: Vec<String> = all.iter().map(|f| key_of(f)).collect();
+            progress.scanning(format!("{} · desktop sessions", proj.display_name), report);
+
+            for (index, filename) in all.into_iter().enumerate() {
+                progress.checking(&items, index, report);
+                let remote_key = key_of(&filename);
+
+                let local_path = if let Some(loc) = local_map.get(&filename) {
+                    loc.path.clone()
+                } else if let Some((_, r_acc, r_org)) = remote_map.get(&filename) {
+                    let exact = desktop_root.join(r_acc).join(r_org);
+                    if exact.is_dir() {
+                        exact.join(&filename)
+                    } else if let Some((def_acc, def_org)) = &default_target {
+                        desktop_root.join(def_acc).join(def_org).join(&filename)
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+
+                let local_path_s = path_str(&local_path);
+                let state = self.db.get_state(&remote_key)?;
+                let local_fp = local_fingerprint(&local_path);
+                let remote_fp = provider.fingerprint(&remote_key);
+                if unchanged_since_last_sync(&state, &local_path_s, &local_fp, &remote_fp) {
+                    continue;
+                }
+                let last_hash = tracked_hash(&state, &local_path_s);
+
+                let local_str = match local_fp {
+                    Some(_) => Some(lossy(read_with_retry(&local_path)?)),
+                    None => None,
+                };
+                let remote_str = provider.read_bytes(&remote_key)?.map(lossy);
+
+                match (local_str, remote_str) {
+                    (Some(local_raw), None) => {
+                        let portable = normalize_desktop_session_json(&local_raw, &ctx);
+                        let h = sha256_hex(portable.as_bytes());
+                        if allow_deletes
+                            && last_hash == Some(h.as_str())
+                            && !modified_within(&local_path, grace)
+                        {
+                            self.trash_local_file(&local_path, &remote_key, report)?;
+                            continue;
+                        }
+                        provider.write_bytes(&remote_key, portable.as_bytes())?;
+                        self.record(provider, &remote_key, &h, &local_path)?;
+                        report.pushed += 1;
+                        activity(report, "push", &remote_key, "Uploaded Claude Desktop session");
+                    }
+                    (None, Some(remote_portable)) => {
+                        let h = sha256_hex(remote_portable.as_bytes());
+                        if allow_deletes && last_hash == Some(h.as_str()) {
+                            self.trash_remote_file(provider, &remote_key, report)?;
+                            continue;
+                        }
+                        let local_restored = denormalize_desktop_session_json(&remote_portable, &ctx);
+                        if !write_local_if_unchanged(&local_path, local_restored.as_bytes(), &None)? {
+                            report.deferred += 1;
+                            continue;
+                        }
+                        self.record(provider, &remote_key, &h, &local_path)?;
+                        report.pulled += 1;
+                        activity(
+                            report,
+                            "pull",
+                            &remote_key,
+                            "Downloaded Claude Desktop session with path remapping",
+                        );
+                    }
+                    (Some(local_raw), Some(remote_portable)) => {
+                        let local_portable = normalize_desktop_session_json(&local_raw, &ctx);
+                        let lh = sha256_hex(local_portable.as_bytes());
+                        let rh = sha256_hex(remote_portable.as_bytes());
+                        if lh == rh {
+                            self.record(provider, &remote_key, &lh, &local_path)?;
+                            continue;
+                        }
+                        let active = modified_within(&local_path, grace);
+                        let push_local = if last_hash == Some(rh.as_str()) {
+                            true
+                        } else if last_hash == Some(lh.as_str()) {
+                            false
+                        } else {
+                            desktop_session_freshness(&local_portable)
+                                >= desktop_session_freshness(&remote_portable)
+                        };
+
+                        if push_local {
+                            provider.write_bytes(&remote_key, local_portable.as_bytes())?;
+                            self.record(provider, &remote_key, &lh, &local_path)?;
+                            report.pushed += 1;
+                            activity(report, "push", &remote_key, "Pushed updated Claude Desktop session");
+                        } else {
+                            let local_restored =
+                                denormalize_desktop_session_json(&remote_portable, &ctx);
+                            if active
+                                || !write_local_if_unchanged(
+                                    &local_path,
+                                    local_restored.as_bytes(),
+                                    &local_fp,
+                                )?
+                            {
+                                self.record_deferred(provider, &remote_key, &rh, &local_path)?;
+                                report.deferred += 1;
+                                continue;
+                            }
+                            self.record(provider, &remote_key, &rh, &local_path)?;
+                            report.pulled += 1;
+                            activity(
+                                report,
+                                "pull",
+                                &remote_key,
+                                "Pulled updated Claude Desktop session with path remapping",
+                            );
+                        }
+                    }
+                    (None, None) => {
+                        if state.is_some() {
+                            self.db.delete_state(&remote_key)?;
+                        }
+                    }
+                }
+            }
+            progress.finished(items.len(), report);
         }
 
         Ok(())
@@ -1971,6 +2246,7 @@ mod tests {
             settings_json: false,
             history_jsonl: false,
             project_memory: false,
+            desktop_sessions: false,
         };
         let mut engine = SyncEngine::new(tmp.path().join("app"), cfg).unwrap();
         let mut updates = Vec::new();
@@ -2476,5 +2752,100 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert!(!pcs.sync.join(REGISTRY_PATH).exists());
         assert!(!pcs.sync.join("machines").exists());
+    }
+
+    #[test]
+    fn syncs_claude_desktop_sessions_across_pcs_with_path_remapping_and_different_accounts() {
+        let pcs = TwoPcs::new();
+        let repo_a = pcs.tmp.path().join("a").join("Dev").join("App");
+        let repo_b = pcs.tmp.path().join("b").join("Dev").join("App");
+        fs::create_dir_all(&repo_b).unwrap();
+        let repo_a_str = normalize_windows_path(&repo_a.to_string_lossy());
+        let repo_b_str = normalize_windows_path(&repo_b.to_string_lossy());
+
+        // Machine A has a CLI session (so project is discovered) AND a Claude Desktop session manifest.
+        write_project_session(&pcs.claude("a"), &repo_a, "cli-1.jsonl", &["u1"]);
+        let desktop_a = pcs.tmp.path().join("a").join("ClaudeDesktop").join("claude-code-sessions");
+        let acc_org_a = desktop_a.join("acc-personal").join("org-personal");
+        fs::create_dir_all(&acc_org_a).unwrap();
+        let session_a = serde_json::json!({
+            "sessionId": "local_abc",
+            "cliSessionId": "cli-1",
+            "cwd": repo_a_str,
+            "originCwd": repo_a_str,
+            "gitAnchors": [{
+                "gitRoot": repo_a_str,
+                "commonDir": format!("{}\\.git", repo_a_str)
+            }],
+            "folderPlace": {
+                "cwd": repo_a_str,
+                "realPath": repo_a_str
+            },
+            "shellFolders": [format!("{}\\src", repo_a_str)],
+            "title": "Fix sync",
+            "lastActivityAt": 1000,
+            "completedTurns": 1
+        });
+        fs::write(
+            acc_org_a.join("local_abc.json"),
+            serde_json::to_string(&session_a).unwrap(),
+        )
+        .unwrap();
+
+        // Machine B has a different Claude Desktop account/org folder.
+        let desktop_b_parent = pcs.tmp.path().join("b").join("ClaudeDesktop");
+        let desktop_b = desktop_b_parent.join("claude-code-sessions");
+        let acc_org_b = desktop_b.join("acc-office").join("org-office");
+        fs::create_dir_all(&acc_org_b).unwrap();
+        fs::write(
+            desktop_b_parent.join("config.json"),
+            r#"{"lastKnownAccountUuid":"acc-office"}"#,
+        )
+        .unwrap();
+
+        let mut a = pcs.engine("a", |c| {
+            c.claude_desktop_dir = Some(desktop_a.clone());
+            c.active_session_grace_secs = 0;
+        });
+        let mut b = pcs.engine("b", |c| {
+            c.claude_desktop_dir = Some(desktop_b.clone());
+            c.active_session_grace_secs = 0;
+        });
+
+        let rep_a = a.sync_all().unwrap();
+        assert_eq!(rep_a.pushed, 2); // 1 .jsonl + 1 local_abc.json
+
+        let rep_b = b.sync_all().unwrap();
+        assert_eq!(rep_b.auto_mapped, 1);
+        assert_eq!(rep_b.pulled, 2);
+
+        let pulled_b_path = acc_org_b.join("local_abc.json");
+        assert!(pulled_b_path.is_file());
+        let pulled_b: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&pulled_b_path).unwrap()).unwrap();
+        assert_eq!(pulled_b["cwd"], repo_b_str);
+        assert_eq!(pulled_b["originCwd"], repo_b_str);
+        assert_eq!(pulled_b["folderPlace"]["realPath"], repo_b_str);
+        assert_eq!(pulled_b["shellFolders"][0], format!("{}\\src", repo_b_str));
+
+        // Re-syncing B must be a no-op and must not duplicate the file under acc-office on the drive.
+        let rep_b2 = b.sync_all().unwrap();
+        assert_eq!(rep_b2.pushed + rep_b2.pulled + rep_b2.merged, 0);
+
+        // Concurrent edits: B has newer lastActivityAt -> wins cleanly without manual conflict.
+        let mut updated_b = pulled_b.clone();
+        updated_b["lastActivityAt"] = serde_json::json!(2000);
+        updated_b["title"] = serde_json::json!("Updated on B");
+        fs::write(&pulled_b_path, serde_json::to_string(&updated_b).unwrap()).unwrap();
+        assert_eq!(b.sync_all().unwrap().pushed, 1);
+
+        let rep_a2 = a.sync_all().unwrap();
+        assert_eq!(rep_a2.pulled, 1);
+        assert_eq!(rep_a2.unresolved_conflicts, 0);
+        let updated_a: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(acc_org_a.join("local_abc.json")).unwrap())
+                .unwrap();
+        assert_eq!(updated_a["title"], "Updated on B");
+        assert_eq!(updated_a["cwd"], repo_a_str);
     }
 }

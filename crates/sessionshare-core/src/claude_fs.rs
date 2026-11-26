@@ -175,6 +175,232 @@ pub fn default_claude_dir() -> PathBuf {
         .join(".claude")
 }
 
+/// Auto-detects Claude Desktop's `claude-code-sessions` directory on Windows.
+/// Checks:
+/// 1. `%LOCALAPPDATA%\Claude-Data\*\claude-code-sessions` (modern MSIX / Store data dir)
+/// 2. `%APPDATA%\Claude\claude-code-sessions` (standard installer)
+/// 3. `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code-sessions` (legacy MSIX)
+pub fn detect_claude_desktop_sessions_dir() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(local_app_data) = dirs::data_local_dir() {
+        let claude_data = local_app_data.join("Claude-Data");
+        if let Ok(entries) = fs::read_dir(&claude_data) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    let p = entry.path().join("claude-code-sessions");
+                    if p.is_dir() {
+                        candidates.push(p);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(roaming_app_data) = dirs::config_dir() {
+        let p = roaming_app_data.join("Claude").join("claude-code-sessions");
+        if p.is_dir() {
+            candidates.push(p);
+        }
+    }
+
+    if let Some(local_app_data) = dirs::data_local_dir() {
+        let packages = local_app_data.join("Packages");
+        if let Ok(entries) = fs::read_dir(&packages) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("Claude_") && entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    let p = entry
+                        .path()
+                        .join("LocalCache")
+                        .join("Roaming")
+                        .join("Claude")
+                        .join("claude-code-sessions");
+                    if p.is_dir() {
+                        candidates.push(p);
+                    }
+                }
+            }
+        }
+    }
+
+    // Prefer a candidate that actually contains account subdirectories.
+    for cand in &candidates {
+        if let Ok(mut rd) = fs::read_dir(cand) {
+            if rd.any(|e| e.ok().and_then(|e| e.file_type().ok()).map(|t| t.is_dir()).unwrap_or(false)) {
+                return Some(cand.clone());
+            }
+        }
+    }
+    candidates.into_iter().next()
+}
+
+/// Resolves the effective `claude-code-sessions` directory from an optional user override
+/// (accepting either the `claude-code-sessions` folder itself or its parent Claude Desktop data folder).
+pub fn resolve_claude_desktop_sessions_dir(configured: Option<&Path>) -> Option<PathBuf> {
+    if let Some(p) = configured {
+        let s = p.to_string_lossy();
+        if !s.trim().is_empty() {
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.eq_ignore_ascii_case("claude-code-sessions"))
+                .unwrap_or(false)
+            {
+                return Some(p.to_path_buf());
+            }
+            let nested = p.join("claude-code-sessions");
+            if nested.is_dir() {
+                return Some(nested);
+            }
+            return Some(p.to_path_buf());
+        }
+    }
+    detect_claude_desktop_sessions_dir()
+}
+
+/// One `local_<uuid>.json` metadata record inside Claude Desktop's `claude-code-sessions`.
+#[derive(Debug, Clone)]
+pub struct DesktopSessionFile {
+    pub account_id: String,
+    pub org_id: String,
+    pub filename: String,
+    pub path: PathBuf,
+    pub cwd: Option<String>,
+}
+
+/// Extracts the normalized working directory (`cwd`) from a Claude Desktop `local_*.json` string.
+pub fn extract_desktop_session_cwd(raw: &str) -> Option<String> {
+    let val: Value = serde_json::from_str(raw).ok()?;
+    let cwd = val
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .or_else(|| val.get("originCwd").and_then(|v| v.as_str()))
+        .or_else(|| {
+            val.get("folderPlace")
+                .and_then(|fp| fp.get("cwd"))
+                .and_then(|v| v.as_str())
+        })?;
+    let trimmed = cwd.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(normalize_windows_path(trimmed))
+    }
+}
+
+/// Scans `<sessions_root>/<account_id>/<org_id>/local_*.json` for all Claude Desktop session files.
+pub fn scan_desktop_sessions(sessions_root: &Path) -> Vec<DesktopSessionFile> {
+    let mut out = Vec::new();
+    let Ok(accounts) = fs::read_dir(sessions_root) else {
+        return out;
+    };
+    for acc_entry in accounts.flatten() {
+        if !acc_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let account_id = acc_entry.file_name().to_string_lossy().to_string();
+        let Ok(orgs) = fs::read_dir(acc_entry.path()) else {
+            continue;
+        };
+        for org_entry in orgs.flatten() {
+            if !org_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let org_id = org_entry.file_name().to_string_lossy().to_string();
+            let Ok(files) = fs::read_dir(org_entry.path()) else {
+                continue;
+            };
+            for file_entry in files.flatten() {
+                if !file_entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let filename = file_entry.file_name().to_string_lossy().to_string();
+                if !filename.starts_with("local_") || !filename.ends_with(".json") {
+                    continue;
+                }
+                let path = file_entry.path();
+                let cwd = fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|raw| extract_desktop_session_cwd(&raw));
+                out.push(DesktopSessionFile {
+                    account_id: account_id.clone(),
+                    org_id: org_id.clone(),
+                    filename,
+                    path,
+                    cwd,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Picks the primary `<account_id>/<org_id>` folder inside `sessions_root` to place newly pulled
+/// sessions when the source PC's exact `<account_id>/<org_id>` does not exist on this PC.
+/// Prefers `lastKnownAccountUuid` from the sibling `config.json`, then the org folder with the
+/// most `local_*.json` files (tie-broken by most recent modification time).
+pub fn default_desktop_account_org(sessions_root: &Path) -> Option<(String, String)> {
+    let preferred_account: Option<String> = sessions_root
+        .parent()
+        .map(|p| p.join("config.json"))
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("lastKnownAccountUuid")
+                .and_then(|a| a.as_str())
+                .map(str::to_string)
+        });
+
+    let mut buckets: Vec<(bool, usize, std::time::SystemTime, String, String)> = Vec::new();
+    let Ok(accounts) = fs::read_dir(sessions_root) else {
+        return None;
+    };
+    for acc_entry in accounts.flatten() {
+        if !acc_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let account_id = acc_entry.file_name().to_string_lossy().to_string();
+        let is_pref = preferred_account
+            .as_deref()
+            .map(|p| p.eq_ignore_ascii_case(&account_id))
+            .unwrap_or(false);
+        let Ok(orgs) = fs::read_dir(acc_entry.path()) else {
+            continue;
+        };
+        for org_entry in orgs.flatten() {
+            if !org_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let org_id = org_entry.file_name().to_string_lossy().to_string();
+            let mut count = 0usize;
+            let mut latest = std::time::UNIX_EPOCH;
+            if let Ok(files) = fs::read_dir(org_entry.path()) {
+                for f in files.flatten() {
+                    let name = f.file_name().to_string_lossy().to_string();
+                    if name.starts_with("local_") && name.ends_with(".json") {
+                        count += 1;
+                        if let Ok(m) = f.metadata().and_then(|m| m.modified()) {
+                            if m > latest {
+                                latest = m;
+                            }
+                        }
+                    }
+                }
+            }
+            buckets.push((is_pref, count, latest, account_id.clone(), org_id));
+        }
+    }
+
+    buckets.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.3.cmp(&b.3))
+            .then_with(|| a.4.cmp(&b.4))
+    });
+    buckets.into_iter().next().map(|(_, _, _, acc, org)| (acc, org))
+}
+
 /// Encodes an absolute local path into Claude Code's project folder name.
 /// Every non-ASCII-alphanumeric character (including `:`, `\`, `/`, spaces, `.`, `_`)
 /// is replaced with `-`.

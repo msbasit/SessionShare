@@ -14,6 +14,7 @@
   const initial = untrack(() => settingsPayload(config));
   let machineName = $state(initial.machine_name);
   let claudeDir = $state(initial.claude_dir);
+  let claudeDesktopDir = $state(initial.claude_desktop_dir ?? "");
   let syncDir = $state(initial.sync_dir ?? "");
   let autoSync = $state(initial.auto_sync);
   let debounceSecs = $state(initial.debounce_secs);
@@ -44,6 +45,13 @@
     if (picked) claudeDir = picked;
   }
 
+  async function pickClaudeDesktopDir() {
+    const picked = await api.pickFolder(
+      "Select Claude Desktop's claude-code-sessions folder (or leave blank to auto-detect)"
+    );
+    if (picked) claudeDesktopDir = picked;
+  }
+
   async function addWorkspaceRoot() {
     const picked = await api.pickFolder("Select a workspace root folder (e.g. C:\\Dev or D:\\Work)");
     if (picked && !workspaceRoots.some((r) => r.toLowerCase() === picked.toLowerCase())) {
@@ -58,6 +66,7 @@
         settingsPayload(config, {
           machine_name: machineName,
           claude_dir: claudeDir,
+          claude_desktop_dir: claudeDesktopDir.trim() || null,
           sync_dir: syncDir.trim() || null,
           auto_sync: autoSync,
           debounce_secs: toInt(debounceSecs, 6, 2),
@@ -111,6 +120,19 @@
     <div class="input-row">
       <input type="text" class="text-input mono" bind:value={claudeDir} />
       <button class="btn" onclick={pickClaudeDir}>Browse...</button>
+    </div>
+  </label>
+
+  <label class="field">
+    <span>Claude Desktop Sessions Directory (optional — leave blank to auto-detect)</span>
+    <div class="input-row">
+      <input
+        type="text"
+        class="text-input mono"
+        bind:value={claudeDesktopDir}
+        placeholder="Auto-detected from %LOCALAPPDATA%\Claude-Data or %APPDATA%\Claude"
+      />
+      <button class="btn" onclick={pickClaudeDesktopDir}>Browse...</button>
     </div>
   </label>
 

@@ -18,6 +18,8 @@ pub struct GlobalSyncOptions {
     pub settings_json: bool,
     pub history_jsonl: bool,
     pub project_memory: bool,
+    #[serde(default = "default_true")]
+    pub desktop_sessions: bool,
 }
 
 fn default_true() -> bool {
@@ -37,6 +39,7 @@ impl Default for GlobalSyncOptions {
             settings_json: true,
             history_jsonl: true,
             project_memory: true,
+            desktop_sessions: true,
         }
     }
 }
@@ -46,6 +49,9 @@ pub struct AppConfig {
     pub machine_id: String,
     pub machine_name: String,
     pub claude_dir: PathBuf,
+    /// Optional override for Claude Desktop's `claude-code-sessions` folder (None = auto-detect).
+    #[serde(default)]
+    pub claude_desktop_dir: Option<PathBuf>,
     pub sync_dir: Option<PathBuf>,
     pub auto_sync: bool,
     pub debounce_secs: u64,
@@ -109,6 +115,7 @@ impl AppConfig {
             machine_id: uuid::Uuid::new_v4().to_string(),
             machine_name: host,
             claude_dir,
+            claude_desktop_dir: None,
             sync_dir: None,
             auto_sync: true,
             debounce_secs: 6,

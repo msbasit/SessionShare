@@ -18,6 +18,7 @@ export function settingsPayload(cfg: AppConfig, overrides: Partial<SettingsPaylo
   return {
     machine_name: cfg.machine_name,
     claude_dir: cfg.claude_dir,
+    claude_desktop_dir: cfg.claude_desktop_dir ?? null,
     sync_dir: cfg.sync_dir,
     auto_sync: cfg.auto_sync,
     debounce_secs: cfg.debounce_secs,

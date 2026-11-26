@@ -9,6 +9,11 @@
   let { options, onToggle }: Props = $props();
 
   const rows: [keyof GlobalSyncOptions, string, string][] = [
+    [
+      "desktop_sessions",
+      "Claude Desktop Sessions",
+      "Syncs Claude Desktop Code tab sidebar sessions (local_*.json) with automatic path remapping",
+    ],
     ["project_memory", "Project Memory (memory/)", "Per-project Claude auto-memory files"],
     ["skills", "Skills (skills/)", "Custom reusable Claude Code skills"],
     ["agents", "Agents (agents/)", "Custom subagent definitions"],

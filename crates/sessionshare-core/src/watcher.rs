@@ -27,7 +27,12 @@ fn first_component_and_rest(path: &Path, root: &Path) -> Option<(String, bool)> 
 }
 
 /// Returns true if a filesystem event at `path` could affect what SessionShare syncs.
-pub fn is_relevant_path(path: &Path, claude_dir: &Path, sync_dir: &Path) -> bool {
+pub fn is_relevant_path(
+    path: &Path,
+    claude_dir: &Path,
+    sync_dir: &Path,
+    desktop_sessions_dir: Option<&Path>,
+) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if name.ends_with(TMP_SUFFIX)
         || name.ends_with(".tmp")
@@ -57,11 +62,17 @@ pub fn is_relevant_path(path: &Path, claude_dir: &Path, sync_dir: &Path) -> bool
                 || CLAUDE_SYNCED_DIRS.contains(&first.as_str())
         };
     }
+    if let Some(desktop_dir) = desktop_sessions_dir {
+        if path.starts_with(desktop_dir) {
+            return name.starts_with("local_") && name.ends_with(".json");
+        }
+    }
     false
 }
 
-/// Watches both `~/.claude` and the synced drive folder with debouncing,
-/// ignoring unrelated/temporary files and suppressing self-triggered events during active syncs.
+/// Watches `~/.claude`, the synced drive folder, and optionally Claude Desktop's
+/// `claude-code-sessions` folder with debouncing, ignoring unrelated/temporary files
+/// and suppressing self-triggered events during active syncs.
 pub struct SyncWatcher {
     _debouncer: Debouncer<notify::RecommendedWatcher>,
 }
@@ -70,6 +81,7 @@ impl SyncWatcher {
     pub fn start<F>(
         claude_dir: PathBuf,
         sync_dir: PathBuf,
+        desktop_sessions_dir: Option<PathBuf>,
         debounce_secs: u64,
         suppress_flag: Arc<AtomicBool>,
         on_change: F,
@@ -84,6 +96,8 @@ impl SyncWatcher {
         let cb = Arc::new(on_change);
         let claude_root = claude_dir.clone();
         let sync_root = sync_dir.clone();
+        let desktop_root = desktop_sessions_dir.filter(|p| p.is_dir());
+        let desktop_root_cb = desktop_root.clone();
         let mut debouncer = new_debouncer(
             Duration::from_secs(debounce_secs.max(2)),
             move |res: std::result::Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
@@ -93,7 +107,12 @@ impl SyncWatcher {
                 if let Ok(events) = res {
                     let relevant = events.iter().any(|ev| {
                         ev.kind == DebouncedEventKind::Any
-                            && is_relevant_path(&ev.path, &claude_root, &sync_root)
+                            && is_relevant_path(
+                                &ev.path,
+                                &claude_root,
+                                &sync_root,
+                                desktop_root_cb.as_deref(),
+                            )
                     });
                     if relevant {
                         cb();
@@ -111,6 +130,11 @@ impl SyncWatcher {
             .watcher()
             .watch(&sync_dir, RecursiveMode::Recursive)
             .map_err(|e| SessionShareError::Watch(format!("{}: {}", sync_dir.display(), e)))?;
+        if let Some(desktop_dir) = desktop_root {
+            let _ = debouncer
+                .watcher()
+                .watch(&desktop_dir, RecursiveMode::Recursive);
+        }
 
         Ok(Self {
             _debouncer: debouncer,
@@ -126,14 +150,21 @@ mod tests {
     fn filters_out_unsynced_and_self_generated_paths() {
         let claude = Path::new(r"C:\Users\A\.claude");
         let sync = Path::new(r"C:\Users\A\OneDrive\SessionShare");
-        let rel = |p: &str| is_relevant_path(Path::new(p), claude, sync);
+        let desktop = Path::new(r"C:\Users\A\AppData\Local\Claude-Data\pkg\claude-code-sessions");
+        let rel = |p: &str| is_relevant_path(Path::new(p), claude, sync, Some(desktop));
 
         assert!(rel(r"C:\Users\A\.claude\projects\C--Dev-App\s1.jsonl"));
         assert!(rel(r"C:\Users\A\.claude\settings.json"));
         assert!(rel(r"C:\Users\A\.claude\skills\x\SKILL.md"));
         assert!(rel(r"C:\Users\A\OneDrive\SessionShare\global\CLAUDE.md"));
         assert!(rel(r"C:\Users\A\OneDrive\SessionShare\registry.json"));
+        assert!(rel(
+            r"C:\Users\A\AppData\Local\Claude-Data\pkg\claude-code-sessions\acc\org\local_123.json"
+        ));
 
+        assert!(!rel(
+            r"C:\Users\A\AppData\Local\Claude-Data\pkg\claude-code-sessions\acc\org\archived-sessions.idx"
+        ));
         assert!(!rel(r"C:\Users\A\.claude\todos\abc.json"));
         assert!(!rel(r"C:\Users\A\.claude\shell-snapshots\snap.sh"));
         assert!(!rel(r"C:\Users\A\.claude\projects\C--Dev-App\sessions-index.json"));

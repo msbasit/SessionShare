@@ -9,12 +9,14 @@ export interface GlobalSyncOptions {
   settings_json: boolean;
   history_jsonl: boolean;
   project_memory: boolean;
+  desktop_sessions: boolean;
 }
 
 export interface AppConfig {
   machine_id: string;
   machine_name: string;
   claude_dir: string;
+  claude_desktop_dir: string | null;
   sync_dir: string | null;
   auto_sync: boolean;
   debounce_secs: number;
@@ -35,6 +37,7 @@ export interface AppConfig {
 export interface SettingsPayload {
   machine_name: string;
   claude_dir: string;
+  claude_desktop_dir: string | null;
   sync_dir: string | null;
   auto_sync: boolean;
   debounce_secs: number;

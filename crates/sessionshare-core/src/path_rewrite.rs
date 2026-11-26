@@ -133,10 +133,56 @@ pub fn denormalize_settings_json(content: &str, ctx: &PathRewriteContext) -> Str
     }
 }
 
+/// Normalizes paths inside a Claude Desktop `local_<uuid>.json` session record into portable tokens
+/// (compact JSON, matching Claude Desktop's on-disk format).
+pub fn normalize_desktop_session_json(content: &str, ctx: &PathRewriteContext) -> String {
+    let roots = ctx.ordered_roots();
+    match serde_json::from_str::<Value>(content) {
+        Ok(mut val) => {
+            rewrite_json_to_portable(&mut val, &roots);
+            serde_json::to_string(&val).unwrap_or_else(|_| content.to_string())
+        }
+        Err(_) => content.to_string(),
+    }
+}
+
+/// Denormalizes portable path tokens inside a Claude Desktop `local_<uuid>.json` back to this PC's paths.
+pub fn denormalize_desktop_session_json(content: &str, ctx: &PathRewriteContext) -> String {
+    match serde_json::from_str::<Value>(content) {
+        Ok(mut val) => {
+            rewrite_json_from_portable(&mut val, ctx);
+            serde_json::to_string(&val).unwrap_or_else(|_| content.to_string())
+        }
+        Err(_) => content.to_string(),
+    }
+}
+
+/// Extracts `(latest_timestamp_ms, completed_turns)` from a Claude Desktop `local_*.json` file
+/// to resolve concurrent updates automatically in favor of the newer state.
+pub fn desktop_session_freshness(content: &str) -> (i64, i64) {
+    let Ok(val) = serde_json::from_str::<Value>(content) else {
+        return (0, 0);
+    };
+    let ts = ["lastActivityAt", "lastTurnEdgeAt", "lastFocusedAt", "createdAt"]
+        .iter()
+        .filter_map(|k| val.get(*k).and_then(|v| v.as_i64()))
+        .max()
+        .unwrap_or(0);
+    let turns = val
+        .get("completedTurns")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    (ts, turns)
+}
+
 fn is_path_key(key: &str) -> bool {
     matches!(
         key,
         "cwd"
+            | "originCwd"
+            | "gitRoot"
+            | "commonDir"
+            | "realPath"
             | "projectPath"
             | "originalPath"
             | "file_path"
@@ -503,5 +549,34 @@ mod tests {
 
         let restored = denormalize_history_jsonl(&portable, &map_b);
         assert!(restored.contains(r#"D:\\Office\\App"#));
+    }
+
+    #[test]
+    fn round_trips_desktop_session_json_paths() {
+        let session = r#"{"sessionId":"local_1","cliSessionId":"cli-1","cwd":"C:\\Users\\Personal\\Dev\\App","originCwd":"C:\\Users\\Personal\\Dev\\App","gitAnchors":[{"gitRoot":"C:\\Users\\Personal\\Dev\\App","commonDir":"C:\\Users\\Personal\\Dev\\App\\.git"}],"folderPlace":{"cwd":"C:\\Users\\Personal\\Dev\\App","realPath":"C:\\Users\\Personal\\Dev\\App"},"shellFolders":["C:\\Users\\Personal\\Dev\\App\\src\\ui"],"lastActivityAt":2000,"completedTurns":3}"#;
+        let ctx_a = PathRewriteContext::new(
+            Some(r"C:\Users\Personal\Dev\App"),
+            r"C:\Users\Personal\.claude",
+            Some(r"C:\Users\Personal"),
+        );
+        let ctx_b = PathRewriteContext::new(
+            Some(r"D:\Work\Repos\App"),
+            r"C:\Users\Work\.claude",
+            Some(r"C:\Users\Work"),
+        );
+
+        let portable = normalize_desktop_session_json(session, &ctx_a);
+        assert!(portable.contains(PROJECT_ROOT_TOKEN));
+        assert!(!portable.contains("Personal"));
+        assert_eq!(desktop_session_freshness(&portable), (2000, 3));
+
+        let restored = denormalize_desktop_session_json(&portable, &ctx_b);
+        let parsed: Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(parsed["cwd"], r"D:\Work\Repos\App");
+        assert_eq!(parsed["originCwd"], r"D:\Work\Repos\App");
+        assert_eq!(parsed["gitAnchors"][0]["gitRoot"], r"D:\Work\Repos\App");
+        assert_eq!(parsed["gitAnchors"][0]["commonDir"], r"D:\Work\Repos\App\.git");
+        assert_eq!(parsed["folderPlace"]["realPath"], r"D:\Work\Repos\App");
+        assert_eq!(parsed["shellFolders"][0], r"D:\Work\Repos\App\src\ui");
     }
 }

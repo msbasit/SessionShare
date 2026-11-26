@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sessionshare_core::claude_fs::default_claude_dir;
+use sessionshare_core::claude_fs::{default_claude_dir, resolve_claude_desktop_sessions_dir};
 use sessionshare_core::models::{
     ActivityEntry, AppConfig, ConflictView, GlobalSyncOptions, MergeConflict, PendingApproval,
     ProjectView, SessionSummary, SyncProgress, SyncReport,
@@ -124,6 +124,8 @@ fn review_count(engine: &SyncEngine) -> usize {
 pub struct SaveSettingsPayload {
     pub machine_name: String,
     pub claude_dir: String,
+    #[serde(default)]
+    pub claude_desktop_dir: Option<String>,
     pub sync_dir: Option<String>,
     pub auto_sync: bool,
     pub debounce_secs: u64,
@@ -228,11 +230,18 @@ fn restart_watcher(app: &AppHandle, shared: &SharedState) {
         return;
     };
 
+    let desktop_dir = if cfg.global_options.desktop_sessions {
+        resolve_claude_desktop_sessions_dir(cfg.claude_desktop_dir.as_deref())
+    } else {
+        None
+    };
+
     let app_handle = app.clone();
     let s = Arc::clone(shared);
     match SyncWatcher::start(
         cfg.claude_dir,
         sync_dir,
+        desktop_dir,
         cfg.debounce_secs,
         Arc::clone(&shared.suppress_watch),
         move || {
@@ -329,6 +338,11 @@ async fn save_settings(
             let mut cfg = engine.config().clone();
             cfg.machine_name = payload.machine_name.trim().to_string();
             cfg.claude_dir = PathBuf::from(payload.claude_dir.trim());
+            cfg.claude_desktop_dir = payload
+                .claude_desktop_dir
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
             cfg.sync_dir = payload
                 .sync_dir
                 .map(|s| s.trim().to_string())
